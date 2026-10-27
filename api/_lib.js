@@ -80,6 +80,9 @@ async function initialize(sql) {
     url TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
   )`;
+  await sql`ALTER TABLE kz_materials ADD COLUMN IF NOT EXISTS file_name TEXT`;
+  await sql`ALTER TABLE kz_materials ADD COLUMN IF NOT EXISTS file_type TEXT`;
+  await sql`ALTER TABLE kz_materials ADD COLUMN IF NOT EXISTS file_data TEXT`;
 
   const admins = await sql`SELECT id FROM kz_users WHERE role = 'admin' LIMIT 1`;
   if (admins.length) return;
@@ -159,7 +162,7 @@ async function state(sql, user) {
     sql`SELECT id, name, login, role, status FROM kz_users ORDER BY name`,
     sql`SELECT id, title, body, author, tag, to_char(created_at AT TIME ZONE 'Europe/Warsaw', 'YYYY-MM-DD') AS date FROM kz_posts ORDER BY created_at DESC`,
     sql`SELECT id, title, to_char(event_date, 'YYYY-MM-DD') AS date, event_time AS time, place, description AS desc FROM kz_events ORDER BY event_date, event_time`,
-    sql`SELECT id, title, description, icon, url FROM kz_materials ORDER BY created_at DESC`,
+    sql`SELECT id, title, description, icon, url, file_name AS "fileName", file_type AS "fileType" FROM kz_materials ORDER BY created_at DESC`,
     inviteQuery
   ]);
   return { users, posts, events, materials, invites };
@@ -172,6 +175,25 @@ async function handle(action, req, res) {
       if (req.method !== 'GET') return send(res, 405, { error: 'Ta czynność nie jest dostępna.' });
       const user = await getUser(sql, req);
       return send(res, 200, { db: await state(sql, user), user });
+    }
+    if (action === 'material-file') {
+      if (req.method !== 'GET') return send(res, 405, { error: 'Ta czynność nie jest dostępna.' });
+      const user = await getUser(sql, req);
+      if (!user) fail(401, 'Zaloguj się, aby pobrać materiał.');
+      const fileId = text(req.query?.id || new URL(req.url, 'https://app.invalid').searchParams.get('id'), 80);
+      if (!fileId) fail(400, 'Nie wskazano pliku.');
+      const rows = await sql`SELECT file_name, file_type, file_data FROM kz_materials WHERE id = ${fileId} LIMIT 1`;
+      const file = rows[0];
+      if (!file?.file_data) fail(404, 'Nie znaleziono pliku.');
+      const bytes = Buffer.from(file.file_data, 'base64');
+      const filename = String(file.file_name || 'material').replace(/[\r\n"\\]/g, '_');
+      res.statusCode = 200;
+      res.setHeader('Content-Type', file.file_type || 'application/octet-stream');
+      res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
+      res.setHeader('Content-Length', String(bytes.length));
+      res.setHeader('Cache-Control', 'private, no-store');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      return res.end(bytes);
     }
     if (req.method !== 'POST') return send(res, 405, { error: 'Ta czynność nie jest dostępna.' });
     const body = await readBody(req);
@@ -281,6 +303,24 @@ async function handle(action, req, res) {
       return send(res, 200, { ok: true });
     }
 
+    if (action === 'delete-material') {
+      if (!['admin', 'teacher'].includes(user.role)) fail(403, 'Tylko nauczyciele i administrator mogą usuwać materiały.');
+      const materialId = text(body.id, 80);
+      if (!materialId) fail(400, 'Nie wskazano materiału do usunięcia.');
+      const deleted = await sql`DELETE FROM kz_materials WHERE id = ${materialId} RETURNING id`;
+      if (!deleted.length) fail(404, 'Nie znaleziono materiału.');
+      return send(res, 200, { ok: true });
+    }
+
+    if (action === 'delete-event') {
+      if (!['admin', 'teacher'].includes(user.role)) fail(403, 'Tylko nauczyciele i administrator mogą usuwać wydarzenia.');
+      const eventId = text(body.id, 80);
+      if (!eventId) fail(400, 'Nie wskazano wydarzenia do usunięcia.');
+      const deleted = await sql`DELETE FROM kz_events WHERE id = ${eventId} RETURNING id`;
+      if (!deleted.length) fail(404, 'Nie znaleziono wydarzenia.');
+      return send(res, 200, { ok: true });
+    }
+
     if (!['admin', 'teacher'].includes(user.role)) fail(403, 'Tylko nauczyciele mogą publikować treści.');
     if (action === 'posts') {
       const title = text(body.title, 160), content = text(body.body, 5000), tag = text(body.tag, 40) || 'Aktualność';
@@ -294,12 +334,30 @@ async function handle(action, req, res) {
       await sql`INSERT INTO kz_events (id, title, event_date, event_time, place) VALUES (${id('event')}, ${title}, ${eventDate}, ${text(body.time, 10)}, ${text(body.place, 100)})`;
       return send(res, 201, { ok: true });
     }
+    if (action === 'update-event') {
+      if (!['admin', 'teacher'].includes(user.role)) fail(403, 'Tylko nauczyciele i administrator mogą edytować wydarzenia.');
+      const eventId = text(body.id, 80), title = text(body.title, 160), eventDate = text(body.date, 10);
+      const parsedDate = new Date(`${eventDate}T00:00:00Z`);
+      if (!eventId || !title || !/^\d{4}-\d{2}-\d{2}$/.test(eventDate) || Number.isNaN(parsedDate.valueOf()) || parsedDate.toISOString().slice(0, 10) !== eventDate) fail(400, 'Wpisz nazwę i prawidłową datę wydarzenia.');
+      const updated = await sql`UPDATE kz_events SET title = ${title}, event_date = ${eventDate}, event_time = ${text(body.time, 10)}, place = ${text(body.place, 100)} WHERE id = ${eventId} RETURNING id`;
+      if (!updated.length) fail(404, 'Nie znaleziono wydarzenia.');
+      return send(res, 200, { ok: true });
+    }
     if (action === 'materials') {
       const title = text(body.title, 160), description = text(body.description, 300), materialUrl = text(body.url, 2000);
+      const fileName = text(body.fileName, 180), fileType = text(body.fileType, 120), fileData = typeof body.fileData === 'string' ? body.fileData : '';
       let validUrl = false;
       try { const parsed = new URL(materialUrl); validUrl = ['http:', 'https:'].includes(parsed.protocol); } catch {}
-      if (!title || !validUrl) fail(400, 'Podaj nazwę i prawidłowy link zaczynający się od http:// lub https://.');
-      await sql`INSERT INTO kz_materials (id, title, description, icon, url) VALUES (${id('material')}, ${title}, ${description}, ${text(body.icon, 8) || '📄'}, ${materialUrl})`;
+      const hasFile = Boolean(fileData || fileName || fileType);
+      if (!title || (validUrl === hasFile)) fail(400, 'Dodaj link albo wybierz plik.');
+      let bytes = null;
+      if (hasFile) {
+        const allowedTypes = new Set(['application/pdf','application/msword','application/vnd.openxmlformats-officedocument.wordprocessingml.document','application/vnd.ms-excel','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet','application/vnd.ms-powerpoint','application/vnd.openxmlformats-officedocument.presentationml.presentation','text/plain','text/csv','image/jpeg','image/png','image/gif','image/webp']);
+        if (!fileName || !fileData || !allowedTypes.has(fileType) || fileData.length > 2800000 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(fileData)) fail(400, 'Wybierz obsługiwany plik (PDF, dokument, arkusz, prezentacja, tekst lub obraz) do 2 MB.');
+        bytes = Buffer.from(fileData, 'base64');
+        if (!bytes.length || bytes.length > 2 * 1024 * 1024 || bytes.toString('base64') !== fileData) fail(400, 'Plik jest pusty, uszkodzony lub przekracza limit 2 MB.');
+      }
+      await sql`INSERT INTO kz_materials (id, title, description, icon, url, file_name, file_type, file_data) VALUES (${id('material')}, ${title}, ${description}, ${text(body.icon, 8) || '📄'}, ${validUrl ? materialUrl : ''}, ${hasFile ? fileName : null}, ${hasFile ? fileType : null}, ${hasFile ? fileData : null})`;
       return send(res, 201, { ok: true });
     }
     return send(res, 404, { error: 'Nie znaleziono tej funkcji.' });
