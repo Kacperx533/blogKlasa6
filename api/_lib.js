@@ -4,15 +4,6 @@ const { neon } = require('@neondatabase/serverless');
 const SESSION_COOKIE = 'class_session';
 const SESSION_DAYS = 7;
 const LOGIN_PATTERN = /^[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż0-9._-]+$/;
-const DEFAULT_DUTY_PAIRS = [
-  { number: 1, first: 'Karolina', second: 'Kuba' },
-  { number: 2, first: 'Ola', second: 'Hania' },
-  { number: 3, first: 'Kacper', second: 'Krzysiu' },
-  { number: 4, first: 'Mikołaj', second: 'Karolina' },
-  { number: 5, first: 'Kuba', second: 'Ola' },
-  { number: 6, first: 'Hania', second: 'Kacper' },
-  { number: 7, first: 'Krzysiu', second: 'Mikołaj' }
-];
 let schemaPromise;
 
 class HttpError extends Error {
@@ -92,18 +83,22 @@ async function initialize(sql) {
   await sql`ALTER TABLE kz_materials ADD COLUMN IF NOT EXISTS file_name TEXT`;
   await sql`ALTER TABLE kz_materials ADD COLUMN IF NOT EXISTS file_type TEXT`;
   await sql`ALTER TABLE kz_materials ADD COLUMN IF NOT EXISTS file_data TEXT`;
-  await sql`CREATE TABLE IF NOT EXISTS kz_duty_settings (
-    id SMALLINT PRIMARY KEY CHECK (id = 1),
-    roster JSONB NOT NULL DEFAULT '[]'::jsonb,
-    start_number INTEGER NOT NULL DEFAULT 0,
-    start_week DATE NOT NULL DEFAULT date_trunc('week', now())::date
+  await sql`CREATE TABLE IF NOT EXISTS kz_tasks (
+    id TEXT PRIMARY KEY,
+    subject TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    due_date DATE NOT NULL,
+    author_id TEXT REFERENCES kz_users(id) ON DELETE SET NULL,
+    author_name TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
   )`;
-  await sql`INSERT INTO kz_duty_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING`;
-  await sql`UPDATE kz_duty_settings
-    SET roster = ${JSON.stringify(DEFAULT_DUTY_PAIRS)}::jsonb,
-        start_number = 2,
-        start_week = date_trunc('week', now())::date
-    WHERE id = 1 AND jsonb_array_length(roster) = 0`;
+  await sql`CREATE TABLE IF NOT EXISTS kz_task_completions (
+    task_id TEXT NOT NULL REFERENCES kz_tasks(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES kz_users(id) ON DELETE CASCADE,
+    completed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (task_id, user_id)
+  )`;
   await sql`CREATE TABLE IF NOT EXISTS kz_countdown_events (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
@@ -194,18 +189,22 @@ async function setSession(sql, user, res) {
 }
 
 async function state(sql, user) {
-  if (!user) return { users: [], posts: [], events: [], materials: [], invites: [], dutyPairs: [], dutyConfig: null, countdownEvents: [], polls: [] };
+  if (!user) return { users: [], posts: [], events: [], materials: [], invites: [], tasks: [], countdownEvents: [], polls: [] };
   const inviteQuery = user.role === 'admin'
     ? sql`SELECT i.name, i.login, i.role, i.code, i.status, i.created_at AS "createdAt", u.id AS "userId"
       FROM kz_invites i LEFT JOIN kz_users u ON lower(u.login) = lower(i.login) ORDER BY i.created_at DESC`
     : Promise.resolve([]);
-  const [users, posts, events, materials, invites, dutyConfig, countdownEvents, polls, voteCounts, userVotes] = await Promise.all([
+  const [users, posts, events, materials, invites, tasks, taskCounts, userTasks, countdownEvents, polls, voteCounts, userVotes] = await Promise.all([
     sql`SELECT id, name, login, role, status FROM kz_users ORDER BY name`,
     sql`SELECT id, title, body, author, tag, to_char(created_at AT TIME ZONE 'Europe/Warsaw', 'YYYY-MM-DD') AS date FROM kz_posts ORDER BY created_at DESC`,
     sql`SELECT id, title, to_char(event_date, 'YYYY-MM-DD') AS date, event_time AS time, place, description AS desc FROM kz_events ORDER BY event_date, event_time`,
     sql`SELECT id, title, description, icon, url, file_name AS "fileName", file_type AS "fileType" FROM kz_materials ORDER BY created_at DESC`,
     inviteQuery,
-    sql`SELECT roster, start_number AS "startNumber", to_char(start_week, 'YYYY-MM-DD') AS "startWeek" FROM kz_duty_settings WHERE id = 1 LIMIT 1`,
+    sql`SELECT t.id, t.subject, t.title, t.description, to_char(t.due_date, 'YYYY-MM-DD') AS "dueDate",
+      t.author_id AS "authorId", t.author_name AS "authorName"
+      FROM kz_tasks t ORDER BY t.due_date, t.created_at DESC`,
+    sql`SELECT task_id AS "taskId", COUNT(*)::int AS count FROM kz_task_completions GROUP BY task_id`,
+    sql`SELECT task_id AS "taskId" FROM kz_task_completions WHERE user_id = ${user.id}`,
     sql`SELECT id, title, to_char(event_date, 'YYYY-MM-DD') AS date FROM kz_countdown_events ORDER BY event_date, created_at`,
     sql`SELECT p.id, p.question, p.options, p.author_id AS "authorId", u.name AS "authorName",
       to_char(p.created_at AT TIME ZONE 'Europe/Warsaw', 'YYYY-MM-DD') AS date
@@ -214,6 +213,9 @@ async function state(sql, user) {
       FROM kz_poll_votes GROUP BY poll_id, option_index`,
     sql`SELECT poll_id AS "pollId", option_index AS "optionIndex" FROM kz_poll_votes WHERE user_id = ${user.id}`
   ]);
+  const taskCompletionCounts = Object.fromEntries(taskCounts.map(row => [row.taskId, row.count]));
+  const completedTaskIds = new Set(userTasks.map(row => row.taskId));
+  const tasksWithStatus = tasks.map(task => ({ ...task, completedCount: taskCompletionCounts[task.id] || 0, completed: completedTaskIds.has(task.id) }));
   const pollCounts = {};
   for (const vote of voteCounts) {
     pollCounts[vote.pollId] ||= {};
@@ -225,7 +227,7 @@ async function state(sql, user) {
     counts: pollCounts[poll.id] || {},
     myOption: userVotes.find(vote => vote.pollId === poll.id)?.optionIndex ?? null
   }));
-  return { users, posts, events, materials, invites, dutyPairs: dutyConfig?.roster || [], dutyConfig: dutyConfig || null, countdownEvents, polls: pollsWithVotes };
+  return { users, posts, events, materials, invites, tasks: tasksWithStatus, countdownEvents, polls: pollsWithVotes };
 }
 
 async function handle(action, req, res) {
@@ -239,6 +241,33 @@ async function handle(action, req, res) {
       if (req.method !== 'POST') return send(res, 405, { error: 'Ta czynność nie jest dostępna.' });
       const body = await readBody(req), user = await getUser(sql, req);
       if (!user) fail(401, 'Zaloguj się, aby wykonać tę czynność.');
+      if (body.operation === 'create-task') {
+        if (!['admin', 'teacher'].includes(user.role)) fail(403, 'Tylko nauczyciel lub administrator może dodawać zadania.');
+        const subject = text(body.subject, 60), title = text(body.title, 180), description = text(body.description, 1200), dueDate = text(body.dueDate, 10);
+        const parsedDate = new Date(`${dueDate}T00:00:00Z`);
+        if (!subject || !title || !/^\d{4}-\d{2}-\d{2}$/.test(dueDate) || Number.isNaN(parsedDate.valueOf()) || parsedDate.toISOString().slice(0, 10) !== dueDate) fail(400, 'Wpisz przedmiot, treść zadania i prawidłowy termin.');
+        await sql`INSERT INTO kz_tasks (id, subject, title, description, due_date, author_id, author_name)
+          VALUES (${id('task')}, ${subject}, ${title}, ${description}, ${dueDate}, ${user.id}, ${user.name})`;
+        return send(res, 201, { ok: true });
+      }
+      if (body.operation === 'toggle-task') {
+        const taskId = text(body.id, 80);
+        if (!taskId || typeof body.completed !== 'boolean') fail(400, 'Nieprawidłowe zadanie.');
+        const found = await sql`SELECT id FROM kz_tasks WHERE id = ${taskId} LIMIT 1`;
+        if (!found.length) fail(404, 'Nie znaleziono zadania.');
+        if (body.completed) await sql`INSERT INTO kz_task_completions (task_id, user_id) VALUES (${taskId}, ${user.id}) ON CONFLICT (task_id, user_id) DO NOTHING`;
+        else await sql`DELETE FROM kz_task_completions WHERE task_id = ${taskId} AND user_id = ${user.id}`;
+        return send(res, 200, { ok: true });
+      }
+      if (body.operation === 'delete-task') {
+        const taskId = text(body.id, 80);
+        if (!taskId) fail(400, 'Nie wskazano zadania do usunięcia.');
+        const rows = await sql`SELECT author_id AS "authorId" FROM kz_tasks WHERE id = ${taskId} LIMIT 1`;
+        if (!rows.length) fail(404, 'Nie znaleziono zadania.');
+        if (user.role !== 'admin' && !(user.role === 'teacher' && rows[0].authorId === user.id)) fail(403, 'Możesz usuwać tylko własne zadania.');
+        await sql`DELETE FROM kz_tasks WHERE id = ${taskId}`;
+        return send(res, 200, { ok: true });
+      }
       if (body.operation === 'create-poll') {
         if (!['admin', 'teacher'].includes(user.role)) fail(403, 'Tylko nauczyciel lub administrator może tworzyć ankiety.');
         const question = text(body.question, 200);
@@ -270,7 +299,7 @@ async function handle(action, req, res) {
         await sql`DELETE FROM kz_polls WHERE id = ${pollId}`;
         return send(res, 200, { ok: true });
       }
-      if (user.role !== 'admin') fail(403, 'Tylko administrator może edytować dyżurnych i odliczanie.');
+      if (user.role !== 'admin') fail(403, 'Tylko administrator może edytować odliczanie.');
       if (body.operation === 'add-countdown-event') {
         const title = text(body.title, 120), eventDate = text(body.date, 10), parsedDate = new Date(`${eventDate}T00:00:00Z`);
         if (!title || !/^\d{4}-\d{2}-\d{2}$/.test(eventDate) || Number.isNaN(parsedDate.valueOf()) || parsedDate.toISOString().slice(0, 10) !== eventDate) fail(400, 'Wpisz nazwę i prawidłową datę odliczania.');
@@ -284,20 +313,7 @@ async function handle(action, req, res) {
         if (!deleted.length) fail(404, 'Nie znaleziono odliczania.');
         return send(res, 200, { ok: true });
       }
-      if (body.operation !== 'save-duty-roster' || !Array.isArray(body.pairs) || body.pairs.length < 1 || body.pairs.length > 100) fail(400, 'Wpisz co najmniej jedną parę dyżurnych.');
-      const pairs = body.pairs.map(pair => ({ number: Number(pair.number), first: text(pair.first, 100), second: text(pair.second, 100) }));
-      if (pairs.some(pair => !Number.isInteger(pair.number) || pair.number < 1 || pair.number > 999 || !pair.first || !pair.second)) fail(400, 'Każdy wiersz musi zawierać numer pary oraz imiona dwóch osób.');
-      if (new Set(pairs.map(pair => pair.number)).size !== pairs.length) fail(400, 'Numery par nie mogą się powtarzać.');
-      pairs.sort((a, b) => a.number - b.number);
-      const validStarts = pairs.map(pair => pair.number);
-      const startNumber = pairs.length ? Number(body.startNumber) : 0;
-      if (pairs.length && !validStarts.includes(startNumber)) fail(400, 'Wybierz jedną z par startowych z listy.');
-      const weekStart = text(body.weekStart, 10), parsedWeek = new Date(`${weekStart}T00:00:00Z`);
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(weekStart) || Number.isNaN(parsedWeek.valueOf()) || parsedWeek.toISOString().slice(0, 10) !== weekStart || parsedWeek.getUTCDay() !== 1) fail(400, 'Nieprawidłowy poniedziałek rozpoczęcia rotacji.');
-      await sql`INSERT INTO kz_duty_settings (id, roster, start_number, start_week)
-        VALUES (1, ${JSON.stringify(pairs)}::jsonb, ${startNumber}, ${weekStart})
-        ON CONFLICT (id) DO UPDATE SET roster = EXCLUDED.roster, start_number = EXCLUDED.start_number, start_week = EXCLUDED.start_week`;
-      return send(res, 200, { ok: true });
+      fail(400, 'Nieznana czynność.');
     }
     if (action === 'materials' && req.method === 'GET') {
       const user = await getUser(sql, req);
