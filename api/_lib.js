@@ -96,6 +96,20 @@ async function initialize(sql) {
     event_date DATE NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
   )`;
+  await sql`CREATE TABLE IF NOT EXISTS kz_polls (
+    id TEXT PRIMARY KEY,
+    question TEXT NOT NULL,
+    options JSONB NOT NULL,
+    author_id TEXT NOT NULL REFERENCES kz_users(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  )`;
+  await sql`CREATE TABLE IF NOT EXISTS kz_poll_votes (
+    poll_id TEXT NOT NULL REFERENCES kz_polls(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES kz_users(id) ON DELETE CASCADE,
+    option_index INTEGER NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (poll_id, user_id)
+  )`;
 
   const admins = await sql`SELECT id FROM kz_users WHERE role = 'admin' LIMIT 1`;
   if (admins.length) return;
@@ -166,21 +180,38 @@ async function setSession(sql, user, res) {
 }
 
 async function state(sql, user) {
-  if (!user) return { users: [], posts: [], events: [], materials: [], invites: [], dutyPairs: [], dutyConfig: null, countdownEvents: [] };
+  if (!user) return { users: [], posts: [], events: [], materials: [], invites: [], dutyPairs: [], dutyConfig: null, countdownEvents: [], polls: [] };
   const inviteQuery = user.role === 'admin'
     ? sql`SELECT i.name, i.login, i.role, i.code, i.status, i.created_at AS "createdAt", u.id AS "userId"
       FROM kz_invites i LEFT JOIN kz_users u ON lower(u.login) = lower(i.login) ORDER BY i.created_at DESC`
     : Promise.resolve([]);
-  const [users, posts, events, materials, invites, dutyConfig, countdownEvents] = await Promise.all([
+  const [users, posts, events, materials, invites, dutyConfig, countdownEvents, polls, voteCounts, userVotes] = await Promise.all([
     sql`SELECT id, name, login, role, status FROM kz_users ORDER BY name`,
     sql`SELECT id, title, body, author, tag, to_char(created_at AT TIME ZONE 'Europe/Warsaw', 'YYYY-MM-DD') AS date FROM kz_posts ORDER BY created_at DESC`,
     sql`SELECT id, title, to_char(event_date, 'YYYY-MM-DD') AS date, event_time AS time, place, description AS desc FROM kz_events ORDER BY event_date, event_time`,
     sql`SELECT id, title, description, icon, url, file_name AS "fileName", file_type AS "fileType" FROM kz_materials ORDER BY created_at DESC`,
     inviteQuery,
     sql`SELECT roster, start_number AS "startNumber", to_char(start_week, 'YYYY-MM-DD') AS "startWeek" FROM kz_duty_settings WHERE id = 1 LIMIT 1`,
-    sql`SELECT id, title, to_char(event_date, 'YYYY-MM-DD') AS date FROM kz_countdown_events ORDER BY event_date, created_at`
+    sql`SELECT id, title, to_char(event_date, 'YYYY-MM-DD') AS date FROM kz_countdown_events ORDER BY event_date, created_at`,
+    sql`SELECT p.id, p.question, p.options, p.author_id AS "authorId", u.name AS "authorName",
+      to_char(p.created_at AT TIME ZONE 'Europe/Warsaw', 'YYYY-MM-DD') AS date
+      FROM kz_polls p JOIN kz_users u ON u.id = p.author_id ORDER BY p.created_at DESC`,
+    sql`SELECT poll_id AS "pollId", option_index AS "optionIndex", COUNT(*)::int AS count
+      FROM kz_poll_votes GROUP BY poll_id, option_index`,
+    sql`SELECT poll_id AS "pollId", option_index AS "optionIndex" FROM kz_poll_votes WHERE user_id = ${user.id}`
   ]);
-  return { users, posts, events, materials, invites, dutyPairs: dutyConfig?.roster || [], dutyConfig: dutyConfig || null, countdownEvents };
+  const pollCounts = {};
+  for (const vote of voteCounts) {
+    pollCounts[vote.pollId] ||= {};
+    pollCounts[vote.pollId][vote.optionIndex] = vote.count;
+  }
+  const pollsWithVotes = polls.map(poll => ({
+    ...poll,
+    options: Array.isArray(poll.options) ? poll.options : [],
+    counts: pollCounts[poll.id] || {},
+    myOption: userVotes.find(vote => vote.pollId === poll.id)?.optionIndex ?? null
+  }));
+  return { users, posts, events, materials, invites, dutyPairs: dutyConfig?.roster || [], dutyConfig: dutyConfig || null, countdownEvents, polls: pollsWithVotes };
 }
 
 async function handle(action, req, res) {
@@ -193,7 +224,38 @@ async function handle(action, req, res) {
       }
       if (req.method !== 'POST') return send(res, 405, { error: 'Ta czynność nie jest dostępna.' });
       const body = await readBody(req), user = await getUser(sql, req);
-      if (!user) fail(401, 'Zaloguj się, aby edytować dyżurnych lub odliczanie.');
+      if (!user) fail(401, 'Zaloguj się, aby wykonać tę czynność.');
+      if (body.operation === 'create-poll') {
+        if (!['admin', 'teacher'].includes(user.role)) fail(403, 'Tylko nauczyciel lub administrator może tworzyć ankiety.');
+        const question = text(body.question, 200);
+        const options = Array.isArray(body.options) ? body.options.map(option => text(option, 100)).filter(Boolean) : [];
+        if (!question || options.length < 2 || options.length > 6) fail(400, 'Podaj pytanie i od 2 do 6 odpowiedzi.');
+        if (new Set(options.map(option => option.toLocaleLowerCase('pl-PL'))).size !== options.length) fail(400, 'Odpowiedzi w ankiecie muszą być różne.');
+        await sql`INSERT INTO kz_polls (id, question, options, author_id)
+          VALUES (${id('poll')}, ${question}, ${JSON.stringify(options)}::jsonb, ${user.id})`;
+        return send(res, 201, { ok: true });
+      }
+      if (body.operation === 'vote-poll') {
+        const pollId = text(body.id, 80), optionIndex = Number(body.optionIndex);
+        if (!pollId || !Number.isInteger(optionIndex) || optionIndex < 0) fail(400, 'Wybierz odpowiedź w ankiecie.');
+        const rows = await sql`SELECT options FROM kz_polls WHERE id = ${pollId} LIMIT 1`;
+        if (!rows.length) fail(404, 'Nie znaleziono ankiety.');
+        const options = rows[0].options;
+        if (!Array.isArray(options) || optionIndex >= options.length) fail(400, 'Ta odpowiedź nie jest dostępna.');
+        await sql`INSERT INTO kz_poll_votes (poll_id, user_id, option_index)
+          VALUES (${pollId}, ${user.id}, ${optionIndex})
+          ON CONFLICT (poll_id, user_id) DO UPDATE SET option_index = EXCLUDED.option_index, created_at = now()`;
+        return send(res, 200, { ok: true });
+      }
+      if (body.operation === 'delete-poll') {
+        const pollId = text(body.id, 80);
+        if (!pollId) fail(400, 'Nie wskazano ankiety do usunięcia.');
+        const rows = await sql`SELECT author_id AS "authorId" FROM kz_polls WHERE id = ${pollId} LIMIT 1`;
+        if (!rows.length) fail(404, 'Nie znaleziono ankiety.');
+        if (user.role !== 'admin' && rows[0].authorId !== user.id) fail(403, 'Możesz usuwać tylko własne ankiety.');
+        await sql`DELETE FROM kz_polls WHERE id = ${pollId}`;
+        return send(res, 200, { ok: true });
+      }
       if (user.role !== 'admin') fail(403, 'Tylko administrator może edytować dyżurnych i odliczanie.');
       if (body.operation === 'add-countdown-event') {
         const title = text(body.title, 120), eventDate = text(body.date, 10), parsedDate = new Date(`${eventDate}T00:00:00Z`);
@@ -208,7 +270,7 @@ async function handle(action, req, res) {
         if (!deleted.length) fail(404, 'Nie znaleziono odliczania.');
         return send(res, 200, { ok: true });
       }
-      if (body.operation !== 'save-duty-roster' || !Array.isArray(body.pairs) || body.pairs.length > 100) fail(400, 'Sprawdź listę par dyżurnych.');
+      if (body.operation !== 'save-duty-roster' || !Array.isArray(body.pairs) || body.pairs.length < 1 || body.pairs.length > 100) fail(400, 'Wpisz co najmniej jedną parę dyżurnych.');
       const pairs = body.pairs.map(pair => ({ number: Number(pair.number), first: text(pair.first, 100), second: text(pair.second, 100) }));
       if (pairs.some(pair => !Number.isInteger(pair.number) || pair.number < 1 || pair.number > 999 || !pair.first || !pair.second)) fail(400, 'Każdy wiersz musi zawierać numer pary oraz imiona dwóch osób.');
       if (new Set(pairs.map(pair => pair.number)).size !== pairs.length) fail(400, 'Numery par nie mogą się powtarzać.');
