@@ -90,6 +90,12 @@ async function initialize(sql) {
     start_week DATE NOT NULL DEFAULT date_trunc('week', now())::date
   )`;
   await sql`INSERT INTO kz_duty_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING`;
+  await sql`CREATE TABLE IF NOT EXISTS kz_countdown_events (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    event_date DATE NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  )`;
 
   const admins = await sql`SELECT id FROM kz_users WHERE role = 'admin' LIMIT 1`;
   if (admins.length) return;
@@ -160,20 +166,21 @@ async function setSession(sql, user, res) {
 }
 
 async function state(sql, user) {
-  if (!user) return { users: [], posts: [], events: [], materials: [], invites: [], dutyRoster: [], dutyConfig: null };
+  if (!user) return { users: [], posts: [], events: [], materials: [], invites: [], dutyPairs: [], dutyConfig: null, countdownEvents: [] };
   const inviteQuery = user.role === 'admin'
     ? sql`SELECT i.name, i.login, i.role, i.code, i.status, i.created_at AS "createdAt", u.id AS "userId"
       FROM kz_invites i LEFT JOIN kz_users u ON lower(u.login) = lower(i.login) ORDER BY i.created_at DESC`
     : Promise.resolve([]);
-  const [users, posts, events, materials, invites, dutyConfig] = await Promise.all([
+  const [users, posts, events, materials, invites, dutyConfig, countdownEvents] = await Promise.all([
     sql`SELECT id, name, login, role, status FROM kz_users ORDER BY name`,
     sql`SELECT id, title, body, author, tag, to_char(created_at AT TIME ZONE 'Europe/Warsaw', 'YYYY-MM-DD') AS date FROM kz_posts ORDER BY created_at DESC`,
     sql`SELECT id, title, to_char(event_date, 'YYYY-MM-DD') AS date, event_time AS time, place, description AS desc FROM kz_events ORDER BY event_date, event_time`,
     sql`SELECT id, title, description, icon, url, file_name AS "fileName", file_type AS "fileType" FROM kz_materials ORDER BY created_at DESC`,
     inviteQuery,
-    sql`SELECT roster, start_number AS "startNumber", to_char(start_week, 'YYYY-MM-DD') AS "startWeek" FROM kz_duty_settings WHERE id = 1 LIMIT 1`
+    sql`SELECT roster, start_number AS "startNumber", to_char(start_week, 'YYYY-MM-DD') AS "startWeek" FROM kz_duty_settings WHERE id = 1 LIMIT 1`,
+    sql`SELECT id, title, to_char(event_date, 'YYYY-MM-DD') AS date FROM kz_countdown_events ORDER BY event_date, created_at`
   ]);
-  return { users, posts, events, materials, invites, dutyRoster: dutyConfig?.roster || [], dutyConfig: dutyConfig || null };
+  return { users, posts, events, materials, invites, dutyPairs: dutyConfig?.roster || [], dutyConfig: dutyConfig || null, countdownEvents };
 }
 
 async function handle(action, req, res) {
@@ -186,21 +193,33 @@ async function handle(action, req, res) {
       }
       if (req.method !== 'POST') return send(res, 405, { error: 'Ta czynność nie jest dostępna.' });
       const body = await readBody(req), user = await getUser(sql, req);
-      if (!user) fail(401, 'Zaloguj się, aby zmienić listę dyżurnych.');
-      if (user.role !== 'admin') fail(403, 'Tylko administrator może edytować listę dyżurnych.');
-      if (body.operation !== 'save-duty-roster' || !Array.isArray(body.students) || body.students.length > 100) fail(400, 'Sprawdź listę uczniów.');
-      const roster = body.students.map(student => ({ number: Number(student.number), name: text(student.name, 100) }));
-      if (roster.some(student => !Number.isInteger(student.number) || student.number < 1 || student.number > 999 || !student.name)) fail(400, 'Każdy wiersz musi zawierać numer z dziennika i imię oraz nazwisko.');
-      if (new Set(roster.map(student => student.number)).size !== roster.length) fail(400, 'Numery w dzienniku nie mogą się powtarzać.');
-      roster.sort((a, b) => a.number - b.number);
-      if (roster.length === 1) fail(400, 'Dodaj co najmniej dwie osoby albo wyczyść całą listę.');
-      const validStarts = roster.filter((_, index) => roster.length % 2 === 1 || index % 2 === 0).map(student => student.number);
-      const startNumber = roster.length ? Number(body.startNumber) : 0;
-      if (roster.length && !validStarts.includes(startNumber)) fail(400, 'Wybierz początek jednej z par z listy.');
+      if (!user) fail(401, 'Zaloguj się, aby edytować dyżurnych lub odliczanie.');
+      if (user.role !== 'admin') fail(403, 'Tylko administrator może edytować dyżurnych i odliczanie.');
+      if (body.operation === 'add-countdown-event') {
+        const title = text(body.title, 120), eventDate = text(body.date, 10), parsedDate = new Date(`${eventDate}T00:00:00Z`);
+        if (!title || !/^\d{4}-\d{2}-\d{2}$/.test(eventDate) || Number.isNaN(parsedDate.valueOf()) || parsedDate.toISOString().slice(0, 10) !== eventDate) fail(400, 'Wpisz nazwę i prawidłową datę odliczania.');
+        await sql`INSERT INTO kz_countdown_events (id, title, event_date) VALUES (${id('countdown')}, ${title}, ${eventDate})`;
+        return send(res, 201, { ok: true });
+      }
+      if (body.operation === 'delete-countdown-event') {
+        const eventId = text(body.id, 80);
+        if (!eventId) fail(400, 'Nie wskazano odliczania do usunięcia.');
+        const deleted = await sql`DELETE FROM kz_countdown_events WHERE id = ${eventId} RETURNING id`;
+        if (!deleted.length) fail(404, 'Nie znaleziono odliczania.');
+        return send(res, 200, { ok: true });
+      }
+      if (body.operation !== 'save-duty-roster' || !Array.isArray(body.pairs) || body.pairs.length > 100) fail(400, 'Sprawdź listę par dyżurnych.');
+      const pairs = body.pairs.map(pair => ({ number: Number(pair.number), first: text(pair.first, 100), second: text(pair.second, 100) }));
+      if (pairs.some(pair => !Number.isInteger(pair.number) || pair.number < 1 || pair.number > 999 || !pair.first || !pair.second)) fail(400, 'Każdy wiersz musi zawierać numer pary oraz imiona dwóch osób.');
+      if (new Set(pairs.map(pair => pair.number)).size !== pairs.length) fail(400, 'Numery par nie mogą się powtarzać.');
+      pairs.sort((a, b) => a.number - b.number);
+      const validStarts = pairs.map(pair => pair.number);
+      const startNumber = pairs.length ? Number(body.startNumber) : 0;
+      if (pairs.length && !validStarts.includes(startNumber)) fail(400, 'Wybierz jedną z par startowych z listy.');
       const weekStart = text(body.weekStart, 10), parsedWeek = new Date(`${weekStart}T00:00:00Z`);
       if (!/^\d{4}-\d{2}-\d{2}$/.test(weekStart) || Number.isNaN(parsedWeek.valueOf()) || parsedWeek.toISOString().slice(0, 10) !== weekStart || parsedWeek.getUTCDay() !== 1) fail(400, 'Nieprawidłowy poniedziałek rozpoczęcia rotacji.');
       await sql`INSERT INTO kz_duty_settings (id, roster, start_number, start_week)
-        VALUES (1, ${JSON.stringify(roster)}::jsonb, ${startNumber}, ${weekStart})
+        VALUES (1, ${JSON.stringify(pairs)}::jsonb, ${startNumber}, ${weekStart})
         ON CONFLICT (id) DO UPDATE SET roster = EXCLUDED.roster, start_number = EXCLUDED.start_number, start_week = EXCLUDED.start_week`;
       return send(res, 200, { ok: true });
     }
