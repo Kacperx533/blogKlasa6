@@ -4,6 +4,15 @@ const { neon } = require('@neondatabase/serverless');
 const SESSION_COOKIE = 'class_session';
 const SESSION_DAYS = 7;
 const LOGIN_PATTERN = /^[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż0-9._-]+$/;
+const DEFAULT_DUTY_PAIRS = [
+  { number: 1, first: 'Karolina', second: 'Kuba' },
+  { number: 2, first: 'Ola', second: 'Hania' },
+  { number: 3, first: 'Kacper', second: 'Krzysiu' },
+  { number: 4, first: 'Mikołaj', second: 'Karolina' },
+  { number: 5, first: 'Kuba', second: 'Ola' },
+  { number: 6, first: 'Hania', second: 'Kacper' },
+  { number: 7, first: 'Krzysiu', second: 'Mikołaj' }
+];
 let schemaPromise;
 
 class HttpError extends Error {
@@ -90,6 +99,11 @@ async function initialize(sql) {
     start_week DATE NOT NULL DEFAULT date_trunc('week', now())::date
   )`;
   await sql`INSERT INTO kz_duty_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING`;
+  await sql`UPDATE kz_duty_settings
+    SET roster = ${JSON.stringify(DEFAULT_DUTY_PAIRS)}::jsonb,
+        start_number = 2,
+        start_week = date_trunc('week', now())::date
+    WHERE id = 1 AND jsonb_array_length(roster) = 0`;
   await sql`CREATE TABLE IF NOT EXISTS kz_countdown_events (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
